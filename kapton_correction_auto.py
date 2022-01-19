@@ -1,3 +1,9 @@
+"""
+ToDo
+    - Test on multiple image
+    - Work with single panel image
+    - Work with water absorption
+"""
 import sys
 sys.path.append('/home/david/dials_dev/modules/dxtbx/src')
 sys.path.append('/home/david/dials_dev/build/lib')
@@ -379,13 +385,12 @@ class kapton_correction_auto():
                 )
         return None
 
-    def fit_model(self):
+    def fit_model(self, method='L-BFGS-B'):
         self.fit_results = minimize(
             self.__target_function,
             x0=(self.angle, self.h, self.f),
-            method='L-BFGS-B',
-            bounds=((0, 2*np.pi), (0.01, None), (0.2, None)),
-            options={'ftol': 1e-09}
+            method=method,
+            bounds=((0, 2*np.pi), (0.01, None), (0.2, None))
             )
         return None
 
