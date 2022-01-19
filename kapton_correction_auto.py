@@ -1,8 +1,7 @@
 """
 ToDo
-    - Test on multiple image
+    - Test on multiple images
     - Work with single panel image
-    - Work with water absorption
 """
 import sys
 sys.path.append('/home/david/dials_dev/modules/dxtbx/src')
@@ -22,7 +21,6 @@ class kapton_correction_auto():
     def __init__(self, file_name, params, results_dir):
         self.save_to_dir = results_dir
         self.image = dxtbx.load(file_name)
-        self.data = self.image.get_raw_data()
         self.detector = self.image.get_detector()
         self.beam = self.image.get_beam()
         self.wavelength = self.beam.get_wavelength()
@@ -32,6 +30,7 @@ class kapton_correction_auto():
         self.panel_size = self.panel_shape[0] * self.panel_shape[1]
         self.kapton_absorption_length\
             = get_absorption_correction()(self.wavelength)
+        self.water_absorption_length = 1.7
         self.n_pixels_full = self.n_panels * self.panel_size
 
         # parameters associated with the:
@@ -57,21 +56,32 @@ class kapton_correction_auto():
         #       this, don't use in optimization
         self.pad = params['pad']
         self.polarization_fraction = params['polarization_fraction']
-        self.max_intensity = params['max_intensity']
-        self.clip = params['clip']
+        self.max_intensity_limit = params['max_intensity_limit']
+        if self.water:
+            self.clip = 1000
+        else:
+            self.clip = params['clip']
         return None
 
-    def __get_polarization(self, phi, theta2):
+    def get_frame(self, frame=None):
+        self.frame = frame
+        if frame is None:
+            self.data = self.image.get_raw_data()
+        else:
+            self.data = self.image.get_raw_data(self.frame)
+        return None
+
+    def _get_polarization(self, phi, theta2):
         factor = np.cos(2*phi)*np.sin(theta2)**2 / (1+np.cos(theta2)**2)
         return 1 - self.polarization_fraction * factor
 
-    def __azimuthal_average(self, theta2, I, mask=None):
+    def _azimuthal_average(self, theta2, I, mask=None):
         # Returns the azimuthally averaged image
         # The average is calculated with histograms - very fast implementation
         #   counts == number of pixels in a bin
         #   sum == summed intensity in a bin
         #   sum / counts == average pixel intensity
-        theta2_bins = np.linspace(0, 60, 121) * np.pi/180
+        theta2_bins = np.linspace(0, 60, 61) * np.pi/180
         theta2_centers = (theta2_bins[1:] + theta2_bins[:-1]) / 2
         if mask is None:
             integration_sum = np.histogram(
@@ -89,13 +99,14 @@ class kapton_correction_auto():
                 bins=theta2_bins
                 )
         integrated = integration_sum[0] / integration_counts[0]
+        az_average = np.column_stack((theta2_centers, integrated))
         indices = np.invert(np.isnan(integrated))
         integrated_image = np.interp(
             theta2, theta2_centers[indices], integrated[indices]
             )
-        return integrated_image
+        return integrated_image, az_average
 
-    def __get_theta2_phi(self, array=False):
+    def _get_theta2_phi(self, array=False):
         # If working with 2D arrays
         if array:
             s0 = self.s_array[:, :, 0]
@@ -111,7 +122,7 @@ class kapton_correction_auto():
         phi = np.pi + np.arctan2(s1, -1*s0)
         return theta2, phi
 
-    def __process_panel(self, data, panel, array=False):
+    def _process_panel(self, data, panel, array=False):
         # This returns information about an individual panel to be fed into
         # a single array to represent the entire image
 
@@ -195,7 +206,7 @@ class kapton_correction_auto():
         self.weights = np.zeros(self.n_pixels_full)
         for index in range(self.n_panels):
             I_panel, s_panel, s_norm_panel, mask_panel, weights_panel\
-                = self.__process_panel(self.data[index], self.detector[index])
+                = self._process_panel(self.data[index], self.detector[index])
             start = index * self.panel_size
             end = (index + 1) * self.panel_size
             self.I[start: end] = I_panel
@@ -212,9 +223,9 @@ class kapton_correction_auto():
         self.s = np.delete(self.s, self.mask, axis=0)
         self.s_norm = np.delete(self.s_norm, self.mask, axis=0)
         self.weights = np.delete(self.weights, self.mask)
-        self.theta2, self.phi = self.__get_theta2_phi()
-        self.polarization = self.__get_polarization(self.phi, self.theta2)
-        self.integrated_image = self.__azimuthal_average(
+        self.theta2, self.phi = self._get_theta2_phi()
+        self.polarization = self._get_polarization(self.phi, self.theta2)
+        self.integrated_image, self.az_average = self._azimuthal_average(
             self.theta2,
             (self.I / self.polarization)
             )
@@ -227,10 +238,19 @@ class kapton_correction_auto():
             angle = self.angle
             h = self.h
             f = self.f
+            v = self.v
+            r_drop = self.r_drop
         else:
-            angle = params[0]
-            h = params[1]
-            f = params[2]
+            if self.water:
+                angle = params[0]
+                h = params[1]
+                f = params[2]
+                v = params[3]
+                r_drop = params[4]
+            else:
+                angle = params[0]
+                h = params[1]
+                f = params[2]
 
         if array:
             s_norm = self.s_norm_array
@@ -325,7 +345,7 @@ class kapton_correction_auto():
 
             delta = h * np.array((0, 1, 0)).T + v * np.array((1, 0, 0)).T
             delta = np.matmul(Rz, delta)
-            delta_snorm = np.matmul(self.s_norm, delta)
+            delta_snorm = np.matmul(s_norm, delta)
             delta_mag = np.linalg.norm(delta)
             L4 = -delta_snorm + np.sqrt(delta_snorm**2 - (delta_mag**2 - r_drop**2))
 
@@ -343,18 +363,26 @@ class kapton_correction_auto():
         else:
             return path_length
 
-    def __absorption_calc(self, L, L_abs):
+    def _absorption_calc(self, L, L_abs):
         return np.exp(-L / L_abs)
 
-    def __target_function(self, params):
-        path_length = self.get_path_length(params)
-        absorption = self.__absorption_calc(
-            path_length, self.kapton_absorption_length
-            )
+    def _target_function(self, params):
+        if self.water:
+            path_length, path_length_water = self.get_path_length(params)
+            absorption_kapton = self._absorption_calc(
+                path_length, self.kapton_absorption_length
+                )
+            absorption_water = self._absorption_calc(
+                path_length_water, self.kapton_absorption_length
+                )
+            absorption = absorption_kapton * absorption_water
+        else:
+            path_length = self.get_path_length(params)
+            absorption = self._absorption_calc(
+                path_length, self.kapton_absorption_length
+                )
         residuals = self.weights * (self.normalized_image - absorption)
-        print(params[0] * 180/np.pi)
-        print(params[1])
-        print(params[2])
+        print(params)
         print(np.linalg.norm(residuals))
         print()
         return np.linalg.norm(residuals)
@@ -364,34 +392,42 @@ class kapton_correction_auto():
             if self.water:
                 self.path_length_array, self.path_length_water_array\
                     = self.get_path_length(array=True)
-                self.absorption_water_array = self.__absorption_calc(
-                    self.path_length_water, self.water_absorption_length
+                self.absorption_water_array = self._absorption_calc(
+                    self.path_length_water_array, self.water_absorption_length
                     )
             else:
                 self.path_length_array = self.get_path_length(array=True)
-            self.absorption_array = self.__absorption_calc(
+            self.absorption_array = self._absorption_calc(
                 self.path_length_array, self.kapton_absorption_length
                 )
         else:
             if self.water:
                 self.path_length, self.path_length_water = self.get_path_length()
-                self.absorption_water = self.__absorption_calc(
+                self.absorption_water = self._absorption_calc(
                     self.path_length_water, self.water_absorption_length
                     )
             else:
                 self.path_length = self.get_path_length()
-            self.absorption = self.__absorption_calc(
+            self.absorption = self._absorption_calc(
                 self.path_length, self.kapton_absorption_length
                 )
         return None
 
     def fit_model(self, method='L-BFGS-B'):
+        angle_bound = np.pi/180 * np.array((250, 290))
+        if self.water:
+            x0 = (self.angle, self.h, self.f, self.v, self.r_drop)
+            bounds = (angle_bound, (0.01, 0.2), (0.2, None), (-0.2, 0.2), (0.01, 0.2))
+        else:
+            x0 = (self.angle, self.h, self.f)
+            bounds = (angle_bound, (0.01, None), (0.2, None))
         self.fit_results = minimize(
-            self.__target_function,
-            x0=(self.angle, self.h, self.f),
+            self._target_function,
+            x0=x0,
             method=method,
-            bounds=((0, 2*np.pi), (0.01, None), (0.2, None))
+            bounds=bounds
             )
+        print(self.fit_results)                  
         return None
 
     def get_image_array(self):
@@ -430,7 +466,7 @@ class kapton_correction_auto():
                 (self.detector[index].get_origin()[:2] - min_pos) / self.pixel_size,
                 decimals=0
                 ).astype(np.int)
-            I_panel, s_panel, s_norm_panel = self.__process_panel(
+            I_panel, s_panel, s_norm_panel = self._process_panel(
                 self.data[index], self.detector[index], array=True
                 )
             indices = np.zeros(max_pos[::-1], dtype=np.bool)
@@ -449,13 +485,13 @@ class kapton_correction_auto():
             self.mask_array,
             self.I_array <= 0
             )
-        self.theta2_array, self.phi_array = self.__get_theta2_phi(array=True)
+        self.theta2_array, self.phi_array = self._get_theta2_phi(array=True)
         self.theta2_array[self.mask_array] = -1
         self.phi_array[self.mask_array] = -1
-        self.polarization_array = self.__get_polarization(
+        self.polarization_array = self._get_polarization(
             self.phi_array, self.theta2_array
             )
-        self.integrated_image_array = self.__azimuthal_average(
+        self.integrated_image_array, self.az_average_array = self._azimuthal_average(
             self.theta2_array,
             (self.I_array / self.polarization_array),
             mask=self.mask_array
@@ -482,7 +518,7 @@ class kapton_correction_auto():
         fig, axes = plt.subplots(1, 1)
         for index, p in enumerate(p_frac):
             self.polarization_fraction = p
-            polarization = self.__get_polarization(self.phi, self.theta2)
+            polarization = self._get_polarization(self.phi, self.theta2)
             normalized_image = self.I / (polarization * self.integrated_image)
             phi_sum = np.histogram(
                 self.phi[indices],
@@ -558,9 +594,6 @@ class kapton_correction_auto():
             axes[0].set_title('Kapton Absorption')
             axes[1].set_title('Water Absorption')
             axes[2].set_title('Total Absorption')
-            fig.tight_layout()
-            fig.savefig(self.save_to_dir + '/Absorption.png')
-            plt.close(fig)
         else:
             fig, axes = plt.subplots(1, 2, figsize=(8, 6))
             im = [[] for index in range(2)]
@@ -572,9 +605,9 @@ class kapton_correction_auto():
             fig.colorbar(im[1], ax=axes[1])
             axes[0].set_title('Kapton Absorption')
             axes[1].set_title('Normalized Image')
-            fig.tight_layout()
-            fig.savefig(self.save_to_dir + '/Absorption.png')
-            plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(self.save_to_dir + '/Absorption.png')
+        plt.close(fig)
 
         # theta2 & phi
         theta2 = 180/np.pi * self.theta2_array.copy()
@@ -596,27 +629,59 @@ class kapton_correction_auto():
         plt.close(fig)
 
         # Raw image and normalized image corrected for absorption
-        fig, axes = plt.subplots(2, 2, figsize=(20, 20))
-        axes[0, 0].imshow(self.I_array, vmin=0, vmax=self.max_intensity)
-        im0 = axes[0, 1].imshow(
-            self.I_array / self.absorption_array,
-            vmin=0, vmax=self.max_intensity
-            )
-        axes[1, 0].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
-        im1 = axes[1, 1].imshow(
-            self.normalized_image_array / self.absorption_array,
-            vmin=0.8, vmax=1.2
-            )
-        for row in range(2):
-            for column in range(2):
-                axes[row, column].set_xticks([])
-                axes[row, column].set_yticks([])
-        fig.colorbar(im0, ax=axes[0, 1])
-        fig.colorbar(im1, ax=axes[1, 1])
-        axes[0, 0].set_title('Initial')
-        axes[0, 1].set_title('Corrected')
-        axes[0, 0].set_ylabel('Raw Image')
-        axes[1, 0].set_ylabel('Normalized Image')
+        if self.water:
+            fig, axes = plt.subplots(2, 3, figsize=(20, 20))
+            axes[0, 0].imshow(self.I_array, vmin=0, vmax=self.max_intensity)
+            axes[0, 1].imshow(
+                self.I_array / self.absorption_array,
+                vmin=0, vmax=self.max_intensity
+                )
+            im02 = axes[0, 2].imshow(
+                self.I_array / (self.absorption_array * self.absorption_water_array),
+                vmin=0, vmax=self.max_intensity
+                )
+            axes[1, 0].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
+            axes[1, 1].imshow(
+                self.normalized_image_array / self.absorption_array,
+                vmin=0.8, vmax=1.2
+                )
+            im12 = axes[1, 1].imshow(
+                self.normalized_image_array / (self.absorption_array * self.absorption_water_array),
+                vmin=0.8, vmax=1.2
+                )
+            for row in range(2):
+                for column in range(2):
+                    axes[row, column].set_xticks([])
+                    axes[row, column].set_yticks([])
+            fig.colorbar(im02, ax=axes[0, 2])
+            fig.colorbar(im12, ax=axes[1, 2])
+            axes[0, 0].set_title('Initial')
+            axes[0, 1].set_title('Corrected')
+            axes[0, 2].set_title('Corrected: With water absorption')
+            axes[0, 0].set_ylabel('Raw Image')
+            axes[1, 0].set_ylabel('Normalized Image')
+        else:
+            fig, axes = plt.subplots(2, 2, figsize=(20, 20))
+            axes[0, 0].imshow(self.I_array, vmin=0, vmax=self.max_intensity)
+            im0 = axes[0, 1].imshow(
+                self.I_array / self.absorption_array,
+                vmin=0, vmax=self.max_intensity
+                )
+            axes[1, 0].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
+            im1 = axes[1, 1].imshow(
+                self.normalized_image_array / self.absorption_array,
+                vmin=0.8, vmax=1.2
+                )
+            for row in range(2):
+                for column in range(2):
+                    axes[row, column].set_xticks([])
+                    axes[row, column].set_yticks([])
+            fig.colorbar(im0, ax=axes[0, 1])
+            fig.colorbar(im1, ax=axes[1, 1])
+            axes[0, 0].set_title('Initial')
+            axes[0, 1].set_title('Corrected')
+            axes[0, 0].set_ylabel('Raw Image')
+            axes[1, 0].set_ylabel('Normalized Image')
         fig.tight_layout()
         fig.savefig(self.save_to_dir + '/Images.png')
         plt.close(fig)
@@ -672,18 +737,62 @@ class kapton_correction_auto():
             )
         averaged_absorption = absorption_sum[0] / counts[0]
         averaged_normalized = normalized_sum[0] / counts[0]
-
         fig, axes = plt.subplots(1, 1)
         axes.plot(bin_centers, averaged_normalized, label='Normalized Image')
-        axes.plot(bin_centers, averaged_absorption, label='Absorption Model')
-        axes.plot(
-            bin_centers, averaged_normalized / averaged_absorption,
-            label='Corrected'
-            )
+        axes.plot(bin_centers, averaged_absorption, label='Kapton Absorption')
+        
+        if self.water:
+            absorption_water_sum = np.histogram(
+                delta_x[np.invert(self.mask_array)].flatten(),
+                bins=delta_x_int,
+                weights=self.absorption_water_array[np.invert(self.mask_array)].flatten()
+                )
+            averaged_water_absorption = absorption_water_sum[0] / counts[0]
+            axes.plot(bin_centers, averaged_water_absorption, label='Water Absorption')
+            axes.plot(
+                bin_centers, averaged_absorption * averaged_water_absorption,
+                label='Total Absorption'
+                )
+            axes.plot(
+                bin_centers,
+                averaged_normalized / (averaged_absorption * averaged_water_absorption),
+                label='Corrected'
+                )
+        else:
+            axes.plot(
+                bin_centers, averaged_normalized / averaged_absorption,
+                label='Corrected'
+                )
         axes.set_xlabel('Perpendicual distance from maximum absorption (mm)')
         axes.set_ylabel('Intensity')
         axes.legend()
         fig.tight_layout()
         fig.savefig(self.save_to_dir + '/1DPlot.png')
         plt.close(fig)
+
+        # Azimuthal Average
+        fig, axes = plt.subplots(1, 1, figsize=(10, 10))
+        axes.plot(self.az_average[:, 0], self.az_average[:, 1], label='Flattened')
+        axes.plot(self.az_average_array[:, 0], self.az_average_array[:, 1], label='Array')
+        axes.set_xlabel('$2\\theta$')
+        axes.set_ylabel('Intensity')
+        axes.legend()
+        fig.tight_layout()
+        fig.savefig(self.save_to_dir + '/AzAverage.png')
+        plt.close(fig)
+        return None
+
+    def get_max_intensity(self):
+        bins_raw_image = np.linspace(0, self.max_intensity_limit, 101)
+        centers_raw_image = (bins_raw_image[1:] + bins_raw_image[:-1]) / 2
+        raw_image_width = bins_raw_image[1] - bins_raw_image[0]
+        hist_raw_image, b = np.histogram(
+            self.I_array[np.invert(self.mask_array)],
+            bins=bins_raw_image,
+            density=True
+            )
+        dI = bins_raw_image[1] - bins_raw_image[0]
+        cummulative_sum = dI * hist_raw_image.cumsum()
+        index = np.where(cummulative_sum > 0.9999)[0][0]
+        self.max_intensity = centers_raw_image[index]
         return None
