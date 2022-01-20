@@ -1,5 +1,6 @@
 """
 ToDo
+    - Fit with water absorption model
     - Test on multiple images
     - Work with single panel image
 """
@@ -35,6 +36,11 @@ class kapton_correction_auto():
         self.f_range = params['f_range']
         self.n_int = params['n_int']
 
+        #   water absorption model
+        self.water = params['water']
+        self.v = params['v']
+        self.r_drop = params['r_drop']
+
         # parameters associated with the algorithm
         #   pad - distance from edge of detector panels to mask
         #   max_intensity - if a pixel is larger than this, include in the mask
@@ -43,7 +49,10 @@ class kapton_correction_auto():
         self.pad = params['pad']
         self.polarization_fraction = params['polarization_fraction']
         self.max_intensity_limit = params['max_intensity_limit']
-        self.clip = params['clip']
+        if self.water:
+            self.clip = 1000
+        else:
+            self.clip = params['clip']
         return None
 
     def load_previous(self, frame=None):
@@ -58,6 +67,9 @@ class kapton_correction_auto():
         self.t = params_json['t']
         self.f_range = params_json['f_range']
         self.n_int = params_json['n_int']
+        self.water = params_json['water']   
+        self.v = params_json['v'] 
+        self.r_drop = params_json['r_drop']
         self.pad = params_json['pad']
         self.polarization_fraction = params_json['polarization_fraction']
         self.max_intensity_limit = params_json['max_intensity_limit']
@@ -69,6 +81,7 @@ class kapton_correction_auto():
         self.panel_shape = params_json['panel_shape']
         self.panel_size = params_json['panel_size']
         self.kapton_absorption_length = params_json['kapton_absorption_length']
+        self.water_absorption_length = params_json['water_absorption_length']
         self.n_pixels_full = params_json['n_pixels_full']
         self.save_to_dir = params_json['save_to_dir']
         self.file_name = params_json['file_name']
@@ -139,6 +152,7 @@ class kapton_correction_auto():
         self.panel_size = self.panel_shape[0] * self.panel_shape[1]
         self.kapton_absorption_length\
             = get_absorption_correction()(self.wavelength)
+        self.get_water_absorption_length()
         self.n_pixels_full = self.n_panels * self.panel_size
 
         self.get_frame()
@@ -154,6 +168,9 @@ class kapton_correction_auto():
             't': self.t,
             'f_range': self.f_range,
             'n_int': self.n_int,
+            'water': self.water,
+            'v': self.v,
+            'r_drop': self.r_drop,
             'pad': self.pad,
             'polarization_fraction': self.polarization_fraction,
             'max_intensity_limit': self.max_intensity_limit,
@@ -165,6 +182,7 @@ class kapton_correction_auto():
             'panel_shape': self.panel_shape,
             'panel_size': self.panel_size,
             'kapton_absorption_length': self.kapton_absorption_length,
+            'water_absorption_length': self.water_absorption_length,
             'n_pixels_full': self.n_pixels_full,
             'save_to_dir': self.save_to_dir,
             'file_name': self.file_name
@@ -391,22 +409,31 @@ class kapton_correction_auto():
             = self.I / (self.polarization * self.integrated_image)
         return None
 
-    def get_path_length(self,  params=None, array=False):
+    def get_path_length(self, water, params=None, array=False):
         if params is None:
             angle = self.angle
             h = self.h
             f = self.f
+            v = self.v
+            r_drop = self.r_drop
         else:
-            angle = params[0]
-            h = params[1]
-            f = params[2]
+            if water:
+                angle = self.angle
+                h = self.h
+                f = self.f
+                v = params[0]
+                r_drop = params[1]
+            else:
+                angle = params[0]
+                h = params[1]
+                f = params[2]
 
         if array:
             s_norm = self.s_norm_array
         else:
             s_norm = self.s_norm
 
-        # Returns the pathlength through the kapton film
+        # Returns the pathlength through the kapton film and water droplet
 
         # s_norm: unit vector pointing from crystal to each detector pixel
         # n1: Vector pointing from crystal to front face of kapton
@@ -470,44 +497,115 @@ class kapton_correction_auto():
                 path_length_int[indices2, index] = L2[indices2] - L1[indices2]
             path_length = np.trapz(path_length_int, f_int, axis=-1) / self.f_range
 
-        return path_length
+        if water:
+            # This calculates the path length through a water droplet
+            # Assumes that the crystal is in a spherical droplet on the kapton film's
+            # front face.
+            # The crystal is a distance h from the kapton film along the n1 vector.
+            #   This is the crystal height model from above.
+            # The crystal is a distance v from the droplet's center along the vector
+            #   along the kapton film.
+            # delta: Vector point from the center of the water droplet on the kapton
+            #   film to the center of the crystal
+            # s1 = unit vector from crystal to pixel
+            # L4 = pathlength from crystal to water droplet surface along n1
+            #   L4*n1 = vector from crystal to water droplet surface
+            # delta = vector from center of water droplet to crystal
+            #   delta = Rz * [h*(0, 1, 0) + v*(1, 0, 0)]
+            # r = vector from center of water droplet on kapton film to water droplet
+            #   surface such that r = delta + L4*n1 and |r| = r_drop.
+            # To calculate L4, start with the relation
+            #   r*r  = (delta + L4*n1)*(delta + L4*n1)
+            #   => L4^2 + l4 * 2n1*delta + [|delta|^2 - |r|^2] = 0
+            #   => L4 = -delta*n1 + sqrt((delta*n1)^2 -(|delta|^2 - r_drop^2)
+
+            delta = -h * np.array((1, 0, 0)).T + v * np.array((0, 1, 0)).T
+            delta = np.matmul(Rz, delta)
+            delta_snorm = np.matmul(s_norm, delta)
+            delta_mag = np.linalg.norm(delta)
+            L4 = -delta_snorm + np.sqrt(delta_snorm**2 - (delta_mag**2 - r_drop**2))
+            # If x-ray reaches the edge of the water droplet sphere before the
+            # kapton film - or does not touch the kapton film at all
+            #   L1 <= 0 => does not reach kapton film
+            #   L4 < L1 => reaches droplet surface before kapton film
+            #       pathlength = L4
+            # Otherwise, the kapton surface truncates the water pathlength and the
+            #   if L1 < L4 and L1 != 0:
+            #       pathlength = L1
+            indices_water1 = np.logical_or(L4 < L1, L1 <= 0)
+            path_length_water = np.zeros(s_norm.shape[:-1])
+            path_length_water[indices_water1] = L4[indices_water1]
+            path_length_water[np.invert(indices_water1)] = L1[np.invert(indices_water1)]
+            return path_length, path_length_water
+        else:
+            return path_length
 
     def _absorption_calc(self, L, L_abs):
         return np.exp(-L / L_abs)
 
-    def _target_function(self, params):
-        path_length = self.get_path_length(params)
-        absorption = self._absorption_calc(
-            path_length, self.kapton_absorption_length
-            )
-        residuals = self.weights * (self.normalized_image - absorption)
+    def _target_function(self, params, water):
+        if water:
+            path_length, path_length_water = self.get_path_length(water, params)
+            absorption_kapton = self._absorption_calc(
+                path_length, self.kapton_absorption_length
+                )
+            absorption_water = self._absorption_calc(
+                path_length_water, self.water_absorption_length
+                )
+            absorption = absorption_kapton * absorption_water
+            scale = params[2]
+        else:
+            path_length = self.get_path_length(water, params)
+            absorption = self._absorption_calc(
+                path_length, self.kapton_absorption_length
+                )
+            scale = 1
+        residuals = self.weights * (self.normalized_image - scale * absorption)
         print(params)
         print(np.linalg.norm(residuals))
         print()
         return np.linalg.norm(residuals)
 
-    def get_absorption(self, array=False):
+    def get_absorption(self, water, array=False):
         if array:
-            self.path_length_array = self.get_path_length(array=True)
+            if water:
+                self.path_length_array, self.path_length_water_array\
+                    = self.get_path_length(water=water, array=True)
+                self.absorption_water_array = self._absorption_calc(
+                    self.path_length_water_array, self.water_absorption_length
+                    )
+            else:
+                self.path_length_array = self.get_path_length(water=water, array=True)
             self.absorption_array = self._absorption_calc(
                 self.path_length_array, self.kapton_absorption_length
                 )
         else:
-            self.path_length = self.get_path_length()
+            if water:
+                self.path_length, self.path_length_water = self.get_path_length(water=water)
+                self.absorption_water = self._absorption_calc(
+                    self.path_length_water, self.water_absorption_length
+                    )
+            else:
+                self.path_length = self.get_path_length(water=water)
             self.absorption = self._absorption_calc(
                 self.path_length, self.kapton_absorption_length
                 )
         return None
 
-    def fit_model(self, method='L-BFGS-B'):
+    def fit_model(self, water, method='L-BFGS-B'):
         angle_bound = np.pi/180 * np.array((-20, 20))
-        x0 = (self.angle, self.h, self.f)
-        bounds = (angle_bound, (0.01, None), (0.2, None))
+        if water:
+            x0 = (self.v, self.r_drop, 1)
+            bounds = ((-0.2, 0.2), (0.01, 0.2), (0, None))
+        else:
+            x0 = (self.angle, self.h, self.f)
+            bounds = (angle_bound, (0.01, None), (0.2, None))
         self.fit_results = minimize(
             self._target_function,
             x0=x0,
             method=method,
-            bounds=bounds
+            bounds=bounds,
+            args=(water)
             )
         print(self.fit_results)                  
         return None
@@ -662,16 +760,31 @@ class kapton_correction_auto():
         fig.savefig(self.save_to_dir + '/Intensity_Histograms.png')
         plt.close(fig)
 
-        fig, axes = plt.subplots(1, 2, figsize=(8, 6))
-        im = [[] for index in range(2)]
-        im[0] = axes[0].imshow(self.absorption_array, vmin=0.8, vmax=1.2)
-        im[1] = axes[1].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
-        for index in range(2):
-            axes[index].set_xticks([])
-            axes[index].set_yticks([])
-        fig.colorbar(im[1], ax=axes[1])
-        axes[0].set_title('Kapton Absorption')
-        axes[1].set_title('Normalized Image')
+        # kapton & water absorption models
+        if self.water:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 6))
+            im = [[] for index in range(3)]
+            im[0] = axes[0].imshow(self.absorption_array)
+            im[1] = axes[1].imshow(self.absorption_water_array)
+            im[2] = axes[2].imshow(self.absorption_array * self.absorption_water_array)
+            for index in range(3):
+                fig.colorbar(im[index], ax=axes[index])
+                axes[index].set_xticks([])
+                axes[index].set_yticks([])
+            axes[0].set_title('Kapton Absorption')
+            axes[1].set_title('Water Absorption')
+            axes[2].set_title('Total Absorption')
+        else:
+            fig, axes = plt.subplots(1, 2, figsize=(8, 6))
+            im = [[] for index in range(2)]
+            im[0] = axes[0].imshow(self.absorption_array, vmin=0.8, vmax=1.2)
+            im[1] = axes[1].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
+            for index in range(2):
+                axes[index].set_xticks([])
+                axes[index].set_yticks([])
+            fig.colorbar(im[1], ax=axes[1])
+            axes[0].set_title('Kapton Absorption')
+            axes[1].set_title('Normalized Image')
         fig.tight_layout()
         fig.savefig(self.save_to_dir + '/Absorption.png')
         plt.close(fig)
@@ -696,27 +809,59 @@ class kapton_correction_auto():
         plt.close(fig)
 
         # Raw image and normalized image corrected for absorption
-        fig, axes = plt.subplots(2, 2, figsize=(20, 20))
-        axes[0, 0].imshow(self.I_array, vmin=0, vmax=self.max_intensity)
-        im0 = axes[0, 1].imshow(
-            self.I_array / self.absorption_array,
-            vmin=0, vmax=self.max_intensity
-            )
-        axes[1, 0].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
-        im1 = axes[1, 1].imshow(
-            self.normalized_image_array / self.absorption_array,
-            vmin=0.8, vmax=1.2
-            )
-        for row in range(2):
-            for column in range(2):
-                axes[row, column].set_xticks([])
-                axes[row, column].set_yticks([])
-        fig.colorbar(im0, ax=axes[0, 1])
-        fig.colorbar(im1, ax=axes[1, 1])
-        axes[0, 0].set_title('Initial')
-        axes[0, 1].set_title('Corrected')
-        axes[0, 0].set_ylabel('Raw Image')
-        axes[1, 0].set_ylabel('Normalized Image')
+        if self.water:
+            fig, axes = plt.subplots(2, 3, figsize=(20, 20))
+            axes[0, 0].imshow(self.I_array, vmin=0, vmax=self.max_intensity)
+            axes[0, 1].imshow(
+                self.I_array / self.absorption_array,
+                vmin=0, vmax=self.max_intensity
+                )
+            im02 = axes[0, 2].imshow(
+                self.I_array / (self.absorption_array * self.absorption_water_array),
+                vmin=0, vmax=self.max_intensity
+                )
+            axes[1, 0].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
+            axes[1, 1].imshow(
+                self.normalized_image_array / self.absorption_array,
+                vmin=0.8, vmax=1.2
+                )
+            im12 = axes[1, 1].imshow(
+                self.normalized_image_array / (self.absorption_array * self.absorption_water_array),
+                vmin=0.8, vmax=1.2
+                )
+            for row in range(2):
+                for column in range(2):
+                    axes[row, column].set_xticks([])
+                    axes[row, column].set_yticks([])
+            fig.colorbar(im02, ax=axes[0, 2])
+            fig.colorbar(im12, ax=axes[1, 2])
+            axes[0, 0].set_title('Initial')
+            axes[0, 1].set_title('Corrected')
+            axes[0, 2].set_title('Corrected: With water absorption')
+            axes[0, 0].set_ylabel('Raw Image')
+            axes[1, 0].set_ylabel('Normalized Image')
+        else:
+            fig, axes = plt.subplots(2, 2, figsize=(20, 20))
+            axes[0, 0].imshow(self.I_array, vmin=0, vmax=self.max_intensity)
+            im0 = axes[0, 1].imshow(
+                self.I_array / self.absorption_array,
+                vmin=0, vmax=self.max_intensity
+                )
+            axes[1, 0].imshow(self.normalized_image_array, vmin=0.8, vmax=1.2)
+            im1 = axes[1, 1].imshow(
+                self.normalized_image_array / self.absorption_array,
+                vmin=0.8, vmax=1.2
+                )
+            for row in range(2):
+                for column in range(2):
+                    axes[row, column].set_xticks([])
+                    axes[row, column].set_yticks([])
+            fig.colorbar(im0, ax=axes[0, 1])
+            fig.colorbar(im1, ax=axes[1, 1])
+            axes[0, 0].set_title('Initial')
+            axes[0, 1].set_title('Corrected')
+            axes[0, 0].set_ylabel('Raw Image')
+            axes[1, 0].set_ylabel('Normalized Image')
         fig.tight_layout()
         fig.savefig(self.save_to_dir + '/Images.png')
         plt.close(fig)
@@ -725,9 +870,9 @@ class kapton_correction_auto():
         self.load_file()
         D = np.abs(self.s_array[:, :, 2])[np.invert(self.mask_array)].mean()
         delta = D * (self.h + self.t) / self.f
-        alpha = self.angle
+        alpha = -1*(self.angle - 3/2 * np.pi)
         b = delta / np.cos(alpha)
-        m = -np.tan(alpha)
+        m = np.tan(alpha)
 
         min_pos = np.zeros(2)
         max_pos = np.zeros(2)
@@ -747,7 +892,7 @@ class kapton_correction_auto():
         y_pix = y / self.pixel_size
         b_pix = b / self.pixel_size
         x = m * (y + min_pos[1]) - b - min_pos[0]
-        
+
         xx, yy = np.meshgrid(
             np.linspace(0, self.I_array.shape[1]*self.pixel_size, self.I_array.shape[1]),
             np.linspace(0, self.I_array.shape[0]*self.pixel_size, self.I_array.shape[0])
@@ -777,10 +922,28 @@ class kapton_correction_auto():
         axes.plot(bin_centers, averaged_normalized, label='Normalized Image')
         axes.plot(bin_centers, averaged_absorption, label='Kapton Absorption')
         
-        axes.plot(
-            bin_centers, averaged_normalized / averaged_absorption,
-            label='Corrected'
-            )
+        if self.water:
+            absorption_water_sum = np.histogram(
+                delta_x[np.invert(self.mask_array)].flatten(),
+                bins=delta_x_int,
+                weights=self.absorption_water_array[np.invert(self.mask_array)].flatten()
+                )
+            averaged_water_absorption = absorption_water_sum[0] / counts[0]
+            axes.plot(bin_centers, averaged_water_absorption, label='Water Absorption')
+            axes.plot(
+                bin_centers, averaged_absorption * averaged_water_absorption,
+                label='Total Absorption'
+                )
+            axes.plot(
+                bin_centers,
+                averaged_normalized / (averaged_absorption * averaged_water_absorption),
+                label='Corrected'
+                )
+        else:
+            axes.plot(
+                bin_centers, averaged_normalized / averaged_absorption,
+                label='Corrected'
+                )
         axes.set_xlabel('Perpendicual distance from maximum absorption (mm)')
         axes.set_ylabel('Intensity')
         axes.legend()
@@ -813,4 +976,52 @@ class kapton_correction_auto():
         cummulative_sum = dI * hist_raw_image.cumsum()
         index = np.where(cummulative_sum > 0.9999)[0][0]
         self.max_intensity = centers_raw_image[index]
+        return None
+
+    def get_water_absorption_length(self):
+        # energy (MeV), mu/rho (cm^2/g)
+        # https://physics.nist.gov/PhysRefData/XrayMassCoef/ComTab/water.html
+        data = np.array([
+            [1.00000E-03,  4.078E+03],
+            [1.50000E-03,  1.376E+03],
+            [2.00000E-03,  6.173E+02],
+            [3.00000E-03,  1.929E+02],
+            [4.00000E-03,  8.278E+01],
+            [5.00000E-03,  4.258E+01],
+            [6.00000E-03,  2.464E+01],
+            [8.00000E-03,  1.037E+01],
+            [1.00000E-02,  5.329E+00],
+            [1.50000E-02,  1.673E+00],
+            [2.00000E-02,  8.096E-01],
+            [3.00000E-02,  3.756E-01],
+            [4.00000E-02,  2.683E-01],
+            [5.00000E-02,  2.269E-01],
+            [6.00000E-02,  2.059E-01],
+            [8.00000E-02,  1.837E-01],
+            [1.00000E-01,  1.707E-01],
+            [1.50000E-01,  1.505E-01],
+            [2.00000E-01,  1.370E-01],
+            [3.00000E-01,  1.186E-01],
+            [4.00000E-01,  1.061E-01],
+            [5.00000E-01,  9.687E-02],
+            [6.00000E-01,  8.956E-02],
+            [8.00000E-01,  7.865E-02],
+            [1.00000E+00,  7.072E-02],
+            [1.25000E+00,  6.323E-02],
+            [1.50000E+00,  5.754E-02],
+            [2.00000E+00,  4.942E-02],
+            [3.00000E+00,  3.969E-02],
+            [4.00000E+00,  3.403E-02],
+            [5.00000E+00,  3.031E-02],
+            [6.00000E+00,  2.770E-02],
+            [8.00000E+00,  2.429E-02],
+            [1.00000E+01,  2.219E-02],
+            [1.50000E+01,  1.941E-02],
+            [2.00000E+01,  1.813E-02]
+            ])
+        water_density = 0.99777 #g/cm^3
+        data[:, 0] *= 10**3
+        energy_kev = factor_kev_angstrom / self.wavelength
+        water_absorption_coefficient = np.interp(energy_kev, data[:, 0], data[:, 1])
+        self.water_absorption_length = 10 / (water_density * water_absorption_coefficient)
         return None
