@@ -1,5 +1,6 @@
 """
 ToDo
+    - Fit with water absorption model
     - Test on multiple images
     - Work with single panel image
 """
@@ -11,28 +12,19 @@ from cctbx import factor_kev_angstrom
 from dials.algorithms.integration.kapton_correction import get_absorption_correction
 from dials.array_family import flex
 import dxtbx
+import json
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 from scipy.optimize import minimize
 
 
 class kapton_correction_auto():
     def __init__(self, file_name, params, results_dir):
         self.save_to_dir = results_dir
-        self.image = dxtbx.load(file_name)
-        self.detector = self.image.get_detector()
-        self.beam = self.image.get_beam()
-        self.wavelength = self.beam.get_wavelength()
-        self.n_panels = len(self.detector)
-        self.pixel_size = self.detector[0].get_pixel_size()[0]
-        self.panel_shape = self.detector[0].get_image_size()
-        self.panel_size = self.panel_shape[0] * self.panel_shape[1]
-        self.kapton_absorption_length\
-            = get_absorption_correction()(self.wavelength)
-        self.water_absorption_length = 1.7
-        self.n_pixels_full = self.n_panels * self.panel_size
-
+        self.file_name = file_name
+        
         # parameters associated with the:
         #   kapton absorption model
         self.angle = params['angle']
@@ -61,6 +53,191 @@ class kapton_correction_auto():
             self.clip = 1000
         else:
             self.clip = params['clip']
+        return None
+
+    def load_previous(self, frame=None):
+        if frame is not None:
+            self.save_to_dir = self.save_to_dir + '/Frame_' + str(frame).zfill(4)
+
+        with open(self.save_to_dir + '/Params_' + str(frame).zfill(4) + '.json', 'r') as json_file:
+            params_json = json.load(json_file)
+        self.angle = params_json['angle']
+        self.h = params_json['h']
+        self.f = params_json['f']
+        self.t = params_json['t']
+        self.f_range = params_json['f_range']
+        self.n_int = params_json['n_int']
+        self.water = params_json['water']   
+        self.v = params_json['v'] 
+        self.r_drop = params_json['r_drop']
+        self.pad = params_json['pad']
+        self.polarization_fraction = params_json['polarization_fraction']
+        self.max_intensity_limit = params_json['max_intensity_limit']
+        self.max_intensity = params_json['max_intensity']
+        self.clip = params_json['clip']
+        self.wavelength = params_json['wavelength']
+        self.n_panels = params_json['n_panels']
+        self.pixel_size = params_json['pixel_size']
+        self.panel_shape = params_json['panel_shape']
+        self.panel_size = params_json['panel_size']
+        self.kapton_absorption_length = params_json['kapton_absorption_length']
+        self.water_absorption_length = params_json['water_absorption_length']
+        self.n_pixels_full = params_json['n_pixels_full']
+        self.save_to_dir = params_json['save_to_dir']
+        self.file_name = params_json['file_name']
+
+        flattened = np.load(
+            self.save_to_dir + '/Flattened_Frame_' + str(frame).zfill(4) + '.npy'
+            )
+        arrayed = np.load(
+            self.save_to_dir + '/Arrayed_Frame_' + str(frame).zfill(4) + '.npy'
+            )
+        averaged = np.load(
+            self.save_to_dir + '/Averaged_Frame_' + str(frame).zfill(4) + '.npy'
+            )
+
+        self.I = flattened[:, 0]
+        self.s = np.zeros((self.I.size, 3))
+        self.s_norm = np.zeros((self.I.size, 3))
+        self.s[:, 0] = flattened[:, 1]
+        self.s[:, 1] = flattened[:, 2]
+        self.s[:, 2] = flattened[:, 3]
+        self.s_norm[:, 0] = flattened[:, 4]
+        self.s_norm[:, 1] = flattened[:, 5]
+        self.s_norm[:, 2] = flattened[:, 6]
+        self.weights = flattened[:, 7]
+        self.theta2 = flattened[:, 8]
+        self.phi = flattened[:, 9]
+        self.polarization = flattened[:, 10]
+        self.integrated_image = flattened[:, 11]
+        self.normalized_image = self.I / (self.polarization * self.integrated_image)
+
+        self.I_array = arrayed[:, :, 0]
+        self.s_array = np.zeros((*self.I_array.shape, 3))
+        self.s_norm_array = np.zeros((*self.I_array.shape, 3))
+        self.s_array[:, :, 0] = arrayed[:, :, 1]
+        self.s_array[:, :, 1] = arrayed[:, :, 2]
+        self.s_array[:, :, 2] = arrayed[:, :, 3]
+        self.s_norm_array[:, :, 0] = arrayed[:, :, 4]
+        self.s_norm_array[:, :, 1] = arrayed[:, :, 5]
+        self.s_norm_array[:, :, 2] = arrayed[:, :, 6]
+        self.mask_array = arrayed[:, :, 7]
+        self.theta2_array = arrayed[:, :, 8]
+        self.phi_array = arrayed[:, :, 9]
+        self.polarization_array = arrayed[:, :, 10]
+        self.integrated_image_array = arrayed[:, :, 11]
+        self.normalized_image_array =\
+            self.I_array / (self.polarization_array * self.integrated_image_array)
+
+        self.az_average = averaged[:, :, 0]
+        self.az_average_array = averaged[:, :, 1]
+        return None
+
+    def load_file(self):
+        self.image = dxtbx.load(self.file_name)
+        self.detector = self.image.get_detector()
+        self.beam = self.image.get_beam()
+        self.wavelength = self.beam.get_wavelength()
+        return None
+
+    def import_and_save(self, frame=None):
+        if frame is not None:
+            self.save_to_dir = self.save_to_dir + '/Frame_' + str(frame).zfill(4)
+        if os.path.exists(self.save_to_dir) is False:
+            os.mkdir(self.save_to_dir)
+        self.load_file()        
+        self.n_panels = len(self.detector)
+        self.pixel_size = self.detector[0].get_pixel_size()[0]
+        self.panel_shape = self.detector[0].get_image_size()
+        self.panel_size = self.panel_shape[0] * self.panel_shape[1]
+        self.kapton_absorption_length\
+            = get_absorption_correction()(self.wavelength)
+        self.get_water_absorption_length()
+        print(self.water_absorption_length)
+        self.n_pixels_full = self.n_panels * self.panel_size
+
+        self.get_frame()
+        self.get_image_array()
+        self.get_max_intensity()
+        self.get_image()
+
+        # Save parameters & fit params
+        params = {
+            'angle': self.angle,
+            'h': self.h,
+            'f': self.f,
+            't': self.t,
+            'f_range': self.f_range,
+            'n_int': self.n_int,
+            'water': self.water,
+            'v': self.v,
+            'r_drop': self.r_drop,
+            'pad': self.pad,
+            'polarization_fraction': self.polarization_fraction,
+            'max_intensity_limit': self.max_intensity_limit,
+            'max_intensity': self.max_intensity,
+            'clip': self.clip,
+            'wavelength': self.wavelength,
+            'n_panels': self.n_panels,
+            'pixel_size': self.pixel_size,
+            'panel_shape': self.panel_shape,
+            'panel_size': self.panel_size,
+            'kapton_absorption_length': self.kapton_absorption_length,
+            'water_absorption_length': self.water_absorption_length,
+            'n_pixels_full': self.n_pixels_full,
+            'save_to_dir': self.save_to_dir,
+            'file_name': self.file_name
+            }
+        with open(self.save_to_dir + '/Params_' + str(frame).zfill(4) + '.json', 'w') as file:
+            file.write(json.dumps(params))
+
+        # Save important arrays
+        flattened = np.column_stack((
+            self.I,
+            self.s[:, 0],
+            self.s[:, 1],
+            self.s[:, 2],
+            self.s_norm[:, 0],
+            self.s_norm[:, 1],
+            self.s_norm[:, 2],
+            self.weights,
+            self.theta2,
+            self.phi,
+            self.polarization,
+            self.integrated_image
+            ))
+        
+        arrayed = np.stack((
+            self.I_array,
+            self.s_array[:, :, 0],
+            self.s_array[:, :, 1],
+            self.s_array[:, :, 2],
+            self.s_norm_array[:, :, 0],
+            self.s_norm_array[:, :, 1],
+            self.s_norm_array[:, :, 2],
+            self.mask_array,
+            self.theta2_array,
+            self.phi_array,
+            self.polarization_array,
+            self.integrated_image_array
+            ), axis=-1)
+        averaged = np.stack((
+            self.az_average,
+            self.az_average_array
+            ), axis=-1)
+
+        np.save(
+            self.save_to_dir + '/Flattened_Frame_' + str(frame).zfill(4) + '.npy',
+            flattened
+            )
+        np.save(
+            self.save_to_dir + '/Arrayed_Frame_' + str(frame).zfill(4) + '.npy',
+            arrayed
+            )
+        np.save(
+            self.save_to_dir + '/Averaged_Frame_' + str(frame).zfill(4) + '.npy',
+            averaged
+            )
         return None
 
     def get_frame(self, frame=None):
@@ -263,8 +440,8 @@ class kapton_correction_auto():
         # n1: Vector pointing from crystal to front face of kapton
         # n2: Vector pointing from crystal to back face of kapton
         # n3: Vector pointing from crystal to far edge of kapton
-        n1 = -h * np.array((0, 1, 0)).T
-        n2 = -(h + self.t) * np.array((0, 1, 0)).T
+        n1 = -h * np.array((1, 0, 0)).T
+        n2 = -(h + self.t) * np.array((1, 0, 0)).T
         n3 = f * np.array((0, 0, 1)).T
 
         # Rotate these vectors to account for the kapton angle
@@ -343,22 +520,23 @@ class kapton_correction_auto():
             #   => L4^2 + l4 * 2n1*delta + [|delta|^2 - |r|^2] = 0
             #   => L4 = -delta*n1 + sqrt((delta*n1)^2 -(|delta|^2 - r_drop^2)
 
-            delta = h * np.array((0, 1, 0)).T + v * np.array((1, 0, 0)).T
+            delta = -h * np.array((1, 0, 0)).T + v * np.array((0, 1, 0)).T
             delta = np.matmul(Rz, delta)
             delta_snorm = np.matmul(s_norm, delta)
             delta_mag = np.linalg.norm(delta)
             L4 = -delta_snorm + np.sqrt(delta_snorm**2 - (delta_mag**2 - r_drop**2))
-
-            # If x-ray path does not go through kapton film, the pathlength is equal to
-            # the distance from the crystal to water droplet's surface.
-            #   if L1 = 0 or L1 > L4:
+            # If x-ray reaches the edge of the water droplet sphere before the
+            # kapton film - or does not touch the kapton film at all
+            #   L1 <= 0 => does not reach kapton film
+            #   L4 < L1 => reaches droplet surface before kapton film
             #       pathlength = L4
             # Otherwise, the kapton surface truncates the water pathlength and the
             #   if L1 < L4 and L1 != 0:
             #       pathlength = L1
-            indices_water1 = np.logical_and(L1 < L4, L1 >= 0)
+            indices_water1 = np.logical_or(L4 < L1, L1 <= 0)
             path_length_water = np.zeros(s_norm.shape[:-1])
-            path_length_water[indices_water1] = L1[indices_water1]
+            path_length_water[indices_water1] = L4[indices_water1]
+            path_length_water[np.invert(indices_water1)] = L1[np.invert(indices_water1)]
             return path_length, path_length_water
         else:
             return path_length
@@ -373,15 +551,17 @@ class kapton_correction_auto():
                 path_length, self.kapton_absorption_length
                 )
             absorption_water = self._absorption_calc(
-                path_length_water, self.kapton_absorption_length
+                path_length_water, self.water_absorption_length
                 )
             absorption = absorption_kapton * absorption_water
+            scale = params[5]
         else:
             path_length = self.get_path_length(params)
             absorption = self._absorption_calc(
                 path_length, self.kapton_absorption_length
                 )
-        residuals = self.weights * (self.normalized_image - absorption)
+            scale = 1
+        residuals = self.weights * (self.normalized_image - scale * absorption)
         print(params)
         print(np.linalg.norm(residuals))
         print()
@@ -414,10 +594,10 @@ class kapton_correction_auto():
         return None
 
     def fit_model(self, method='L-BFGS-B'):
-        angle_bound = np.pi/180 * np.array((250, 290))
+        angle_bound = np.pi/180 * np.array((-20, 20))
         if self.water:
-            x0 = (self.angle, self.h, self.f, self.v, self.r_drop)
-            bounds = (angle_bound, (0.01, 0.2), (0.2, None), (-0.2, 0.2), (0.01, 0.2))
+            x0 = (self.angle, self.h, self.f, self.v, self.r_drop, 1)
+            bounds = (angle_bound, (0.01, 0.2), (0.2, None), (-0.2, 0.2), (0.01, 0.2), (0, None))
         else:
             x0 = (self.angle, self.h, self.f)
             bounds = (angle_bound, (0.01, None), (0.2, None))
@@ -795,4 +975,52 @@ class kapton_correction_auto():
         cummulative_sum = dI * hist_raw_image.cumsum()
         index = np.where(cummulative_sum > 0.9999)[0][0]
         self.max_intensity = centers_raw_image[index]
+        return None
+
+    def get_water_absorption_length(self):
+        # energy (MeV), mu/rho (cm^2/g)
+        # https://physics.nist.gov/PhysRefData/XrayMassCoef/ComTab/water.html
+        data = np.array([
+            [1.00000E-03,  4.078E+03],
+            [1.50000E-03,  1.376E+03],
+            [2.00000E-03,  6.173E+02],
+            [3.00000E-03,  1.929E+02],
+            [4.00000E-03,  8.278E+01],
+            [5.00000E-03,  4.258E+01],
+            [6.00000E-03,  2.464E+01],
+            [8.00000E-03,  1.037E+01],
+            [1.00000E-02,  5.329E+00],
+            [1.50000E-02,  1.673E+00],
+            [2.00000E-02,  8.096E-01],
+            [3.00000E-02,  3.756E-01],
+            [4.00000E-02,  2.683E-01],
+            [5.00000E-02,  2.269E-01],
+            [6.00000E-02,  2.059E-01],
+            [8.00000E-02,  1.837E-01],
+            [1.00000E-01,  1.707E-01],
+            [1.50000E-01,  1.505E-01],
+            [2.00000E-01,  1.370E-01],
+            [3.00000E-01,  1.186E-01],
+            [4.00000E-01,  1.061E-01],
+            [5.00000E-01,  9.687E-02],
+            [6.00000E-01,  8.956E-02],
+            [8.00000E-01,  7.865E-02],
+            [1.00000E+00,  7.072E-02],
+            [1.25000E+00,  6.323E-02],
+            [1.50000E+00,  5.754E-02],
+            [2.00000E+00,  4.942E-02],
+            [3.00000E+00,  3.969E-02],
+            [4.00000E+00,  3.403E-02],
+            [5.00000E+00,  3.031E-02],
+            [6.00000E+00,  2.770E-02],
+            [8.00000E+00,  2.429E-02],
+            [1.00000E+01,  2.219E-02],
+            [1.50000E+01,  1.941E-02],
+            [2.00000E+01,  1.813E-02]
+            ])
+        water_density = 0.99777 #g/cm^3
+        data[:, 0] *= 10**3
+        energy_kev = factor_kev_angstrom / self.wavelength
+        water_absorption_coefficient = np.interp(energy_kev, data[:, 0], data[:, 1])
+        self.water_absorption_length = 10 / (water_density * water_absorption_coefficient)
         return None
